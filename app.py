@@ -1,6 +1,8 @@
 import streamlit as st
 import httpx
 from datetime import datetime
+import json
+import time
 
 st.set_page_config(page_title="AgentRx", page_icon="🩺", layout="wide")
 
@@ -46,29 +48,91 @@ def call_agent(url, prompt):
     except Exception as e:
         return None, {"error": str(e)}
 
-def wake_servers():
-    for url in [f"{IRON_THREAD}/health", f"{TEST_THREAD}/health", f"{POLICY_THREAD}/health"]:
+def retry_with_backoff(func, max_retries=3, initial_delay=5, service_name="API"):
+    """
+    Retry a function with exponential backoff for handling cold starts.
+    Built by IBM Bob for robust Render free tier integration.
+    
+    Args:
+        func: Callable that returns httpx.Response
+        max_retries: Maximum number of retry attempts (default: 3)
+        initial_delay: Initial delay in seconds, doubles each retry (default: 5)
+        service_name: Name of service for user feedback (default: "API")
+    
+    Returns:
+        httpx.Response: The successful response
+        
+    Raises:
+        Exception: If all retries are exhausted or non-retryable error occurs
+    """
+    for attempt in range(max_retries):
         try:
-            httpx.get(url, timeout=35)
+            response = func()
+            return response  # Success - return the response
+        except (httpx.TimeoutException, httpx.ConnectError, httpx.ReadTimeout) as e:
+            if attempt < max_retries - 1:
+                delay = initial_delay * (2 ** attempt)
+                st.warning(f"⏳ {service_name} cold-starting... Retry {attempt + 1}/{max_retries} in {delay}s")
+                time.sleep(delay)
+            else:
+                raise Exception(f"{service_name} failed after {max_retries} attempts: {str(e)}")
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code >= 500 and attempt < max_retries - 1:
+                delay = initial_delay * (2 ** attempt)
+                st.warning(f"⏳ {service_name} server error (5xx)... Retry {attempt + 1}/{max_retries} in {delay}s")
+                time.sleep(delay)
+            else:
+                raise
+        except Exception as e:
+            raise
+    
+    # This should never be reached due to the raise in the last attempt
+    raise Exception(f"{service_name} failed after {max_retries} attempts")
+
+def wake_servers():
+    """Wake up Render free tier servers with retry logic"""
+    servers = [
+        (f"{IRON_THREAD}/health", "Iron-Thread"),
+        (f"{TEST_THREAD}/health", "TestThread"),
+        (f"{POLICY_THREAD}/health", "PolicyThread")
+    ]
+    
+    for url, name in servers:
+        def health_check():
+            return httpx.get(url, timeout=60)
+        
+        try:
+            retry_with_backoff(health_check, max_retries=3, initial_delay=10, service_name=name)
         except Exception:
-            pass
+            pass  # Continue even if health check fails
 
 def run_structure_check(agent_output, timestamp):
     result = {"passed": False, "details": {}, "error": None}
     try:
-        schema_r = httpx.post(
-            f"{IRON_THREAD}/schemas",
-            json={"name": f"agentrx-{timestamp}", "schema_definition": {"type": "object", "properties": {"output": {"type": "string"}}, "required": ["output"]}},
-            timeout=60
-        )
-        schema_r.raise_for_status()
+        # Create schema with retry logic
+        def create_schema():
+            r = httpx.post(
+                f"{IRON_THREAD}/schemas",
+                json={"name": f"agentrx-{timestamp}", "schema_definition": {"type": "object", "properties": {"output": {"type": "string"}}, "required": ["output"]}},
+                timeout=90
+            )
+            r.raise_for_status()
+            return r
+        
+        schema_r = retry_with_backoff(create_schema, max_retries=3, initial_delay=5, service_name="Iron-Thread")
         schema_id = schema_r.json()["id"]
-        val_r = httpx.post(
-            f"{IRON_THREAD}/validate",
-            json={"schema_id": schema_id, "raw_ai_output": str(agent_output) if agent_output else "{}", "model_used": "unknown"},
-            timeout=60
-        )
-        val_r.raise_for_status()
+        
+        # Validate with retry logic
+        def validate_output():
+            r = httpx.post(
+                f"{IRON_THREAD}/validate",
+                json={"schema_id": schema_id, "raw_ai_output": str(agent_output) if agent_output else "{}", "model_used": "unknown"},
+                timeout=90
+            )
+            r.raise_for_status()
+            return r
+        
+        val_r = retry_with_backoff(validate_output, max_retries=3, initial_delay=5, service_name="Iron-Thread")
         val_data = val_r.json()
         result["details"] = val_data
         result["passed"] = val_data.get("status") in ["passed", "corrected"]
@@ -79,18 +143,40 @@ def run_structure_check(agent_output, timestamp):
 def run_behavior_check(agent_url, timestamp, test_prompt):
     result = {"passed": False, "score": 0.0, "details": {}, "error": None}
     try:
-        suite_r = httpx.post(f"{TEST_THREAD}/suites", json={"name": f"agentrx-{timestamp}", "agent_endpoint": agent_url}, timeout=60)
-        suite_r.raise_for_status()
+        # Create suite with retry logic
+        def create_suite():
+            r = httpx.post(
+                f"{TEST_THREAD}/suites",
+                json={"name": f"agentrx-{timestamp}", "agent_endpoint": agent_url},
+                timeout=90
+            )
+            r.raise_for_status()
+            return r
+        
+        suite_r = retry_with_backoff(create_suite, max_retries=3, initial_delay=5, service_name="TestThread")
         suite_id = suite_r.json()["id"]
+        
+        # Add test cases with retry logic
         cases = [
             {"name": "Basic Response", "input": test_prompt, "expected_output": "", "match_type": "contains"},
             {"name": "Instruction Following", "input": "Reply with exactly the word: READY", "expected_output": "READY", "match_type": "contains"},
             {"name": "Simple Arithmetic", "input": "What is 2 + 2? Reply with just the number.", "expected_output": "4", "match_type": "contains"}
         ]
+        
         for case in cases:
-            httpx.post(f"{TEST_THREAD}/suites/{suite_id}/cases", json=case, timeout=60)
-        run_r = httpx.post(f"{TEST_THREAD}/suites/{suite_id}/run", timeout=120)
-        run_r.raise_for_status()
+            def add_case():
+                r = httpx.post(f"{TEST_THREAD}/suites/{suite_id}/cases", json=case, timeout=90)
+                r.raise_for_status()
+                return r
+            retry_with_backoff(add_case, max_retries=2, initial_delay=3, service_name="TestThread")
+        
+        # Run suite with retry logic
+        def run_suite():
+            r = httpx.post(f"{TEST_THREAD}/suites/{suite_id}/run", timeout=150)
+            r.raise_for_status()
+            return r
+        
+        run_r = retry_with_backoff(run_suite, max_retries=3, initial_delay=5, service_name="TestThread")
         run_data = run_r.json()
         result["details"] = run_data
         total = run_data.get("total", 3)
@@ -105,15 +191,36 @@ def run_compliance_check(agent_output, test_prompt, domain, timestamp):
     result = {"passed": False, "details": {}, "policy_ids": [], "error": None}
     try:
         policy_ids = []
+        
+        # Create policies with retry logic
         for policy in DOMAIN_POLICIES[domain]:
-            p_r = httpx.post(f"{POLICY_THREAD}/policies", json=policy, timeout=60)
-            if p_r.status_code in [200, 201]:
-                pid = p_r.json().get("id")
-                if pid:
-                    policy_ids.append(pid)
+            def create_policy():
+                r = httpx.post(f"{POLICY_THREAD}/policies", json=policy, timeout=90)
+                r.raise_for_status()
+                return r
+            
+            try:
+                p_r = retry_with_backoff(create_policy, max_retries=3, initial_delay=5, service_name="PolicyThread")
+                if p_r.status_code in [200, 201]:
+                    pid = p_r.json().get("id")
+                    if pid:
+                        policy_ids.append(pid)
+            except Exception:
+                continue  # Skip failed policy creation
+        
         result["policy_ids"] = policy_ids
-        eval_r = httpx.post(f"{POLICY_THREAD}/evaluate", json={"user_input": test_prompt, "ai_output": agent_output, "model_used": "unknown"}, timeout=60)
-        eval_r.raise_for_status()
+        
+        # Evaluate compliance with retry logic
+        def evaluate_compliance():
+            r = httpx.post(
+                f"{POLICY_THREAD}/evaluate",
+                json={"user_input": test_prompt, "ai_output": agent_output, "model_used": "unknown"},
+                timeout=90
+            )
+            r.raise_for_status()
+            return r
+        
+        eval_r = retry_with_backoff(evaluate_compliance, max_retries=3, initial_delay=5, service_name="PolicyThread")
         eval_data = eval_r.json()
         result["details"] = eval_data
         result["passed"] = eval_data.get("passed", False)
@@ -143,7 +250,7 @@ if run_button:
 
     timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
 
-    with st.spinner("Waking up Thread Suite servers (can take ~30 seconds on first run)..."):
+    with st.spinner("🚀 Waking up Thread Suite servers (Render free tier cold start can take 30-60s)..."):
         wake_servers()
 
     st.info("Servers ready. Running audit...")
