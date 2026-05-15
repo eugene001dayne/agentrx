@@ -11,7 +11,7 @@ AgentRx audits any AI agent endpoint in three dimensions:
 Returns a Reliability Score (0-100) with specific failures and recommendations.
 
 ## Live Demo
-https://agentrx.streamlit.app
+https://agentrx-jmgwrtospmzmc8ka6grwxx.streamlit.app
 
 ## How to run locally
 pip install streamlit httpx
